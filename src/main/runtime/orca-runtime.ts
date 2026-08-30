@@ -1798,14 +1798,15 @@ function copySleepingAgentLaunchConfig(
 }
 
 function normalizeAgentLaunchCommandForMatch(command: string): string {
-  return command.trim().replace(/\s+/g, ' ')
+  const normalized = command.trim().replace(/\s+/g, ' ')
+  const quoted = /^(['"])(.*)\1$/.exec(normalized)
+  return quoted ? quoted[2]!.trim().replace(/\s+/g, ' ') : normalized
 }
 
 function resolveBareAgentLaunchCommand(args: {
   command: string | undefined
   settings: {
     agentCmdOverrides?: Partial<Record<TuiAgent, string>> | null
-    disabledTuiAgents?: Iterable<unknown> | null
   }
   platform: NodeJS.Platform
   isRemote: boolean
@@ -1817,9 +1818,6 @@ function resolveBareAgentLaunchCommand(args: {
 
   const cmdOverrides = args.settings.agentCmdOverrides ?? {}
   for (const agent of Object.keys(TUI_AGENT_CONFIG) as TuiAgent[]) {
-    if (!isTuiAgentEnabled(agent, args.settings.disabledTuiAgents)) {
-      continue
-    }
     const override = cmdOverrides[agent]?.trim()
     const defaultLaunchCommand = getTuiAgentLaunchCommand(TUI_AGENT_CONFIG[agent], args.platform, {
       isRemote: args.isRemote
@@ -4452,6 +4450,7 @@ export class OrcaRuntimeService {
     if (!this.store?.createAutomation) {
       throw new Error('runtime_unavailable')
     }
+    this.validateOrchestrationAgentLauncher(input.agentId)
     const target = await this.resolveAutomationTarget(input)
     assertAutomationRunContextMatchesRepo(input.runContext, target.repo)
     if (input.reuseSession && target.workspaceMode !== 'existing') {
@@ -4511,6 +4510,12 @@ export class OrcaRuntimeService {
       throw new Error('runtime_unavailable')
     }
     const current = this.showAutomation(id)
+    const updatedAgent = hasRuntimeAutomationUpdateValue(updates, 'agentId')
+      ? updates.agentId
+      : undefined
+    if (updatedAgent) {
+      this.validateOrchestrationAgentLauncher(updatedAgent)
+    }
     const patch: AutomationUpdateInput = {}
     if (hasRuntimeAutomationUpdateValue(updates, 'name')) {
       patch.name = updates.name
@@ -4521,8 +4526,8 @@ export class OrcaRuntimeService {
     if (hasRuntimeAutomationUpdateValue(updates, 'precheck')) {
       patch.precheck = updates.precheck
     }
-    if (hasRuntimeAutomationUpdateValue(updates, 'agentId')) {
-      patch.agentId = updates.agentId
+    if (updatedAgent) {
+      patch.agentId = updatedAgent
     }
     if (hasRuntimeAutomationUpdateValue(updates, 'runContext')) {
       patch.runContext = updates.runContext
@@ -20407,17 +20412,24 @@ export class OrcaRuntimeService {
     })
   }
 
-  validateOrchestrationAgentLauncher(agent: TuiAgent): void {
-    const settings = this.store?.getSettings()
-    if (!settings) {
-      throw new Error('runtime_unavailable')
-    }
-    if (!isTuiAgentEnabled(agent, settings.disabledTuiAgents)) {
+  private assertTuiAgentLauncherEnabled(
+    agent: TuiAgent,
+    disabledTuiAgents?: Iterable<unknown> | null
+  ): void {
+    if (!isTuiAgentEnabled(agent, disabledTuiAgents)) {
       throw new OrchestrationError(
         'agent_unconfigured',
         `Agent launcher ${agent} is disabled or unavailable.`
       )
     }
+  }
+
+  validateOrchestrationAgentLauncher(agent: TuiAgent): void {
+    const settings = this.store?.getSettings()
+    if (!settings) {
+      throw new Error('runtime_unavailable')
+    }
+    this.assertTuiAgentLauncherEnabled(agent, settings.disabledTuiAgents)
   }
 
   resolveTerminalPane(paneKey: string, expectedWorktreeId?: string): RuntimeTerminalResolvePane {
@@ -26059,9 +26071,7 @@ export class OrcaRuntimeService {
       throw new Error('runtime_unavailable')
     }
     const settings = this.store.getSettings()
-    if (!isTuiAgentEnabled(agent, settings.disabledTuiAgents)) {
-      throw new Error('Selected agent is disabled. Choose an enabled agent before creating.')
-    }
+    this.assertTuiAgentLauncherEnabled(agent, settings.disabledTuiAgents)
     // Why: CLI clients may target SSH runtimes from macOS/Windows, so quote for
     // the workspace shell rather than the client shell.
     const agentLaunchPlatform = this.getAgentLaunchPlatformForRepo(repo)
@@ -26558,18 +26568,16 @@ export class OrcaRuntimeService {
     const createSettings = this.store.getSettings()
     const requestedAgent = args.startupAgent ?? args.createdWithAgent
     const requestedAgentEnabled =
-      requestedAgent !== undefined
-        ? isTuiAgentEnabled(requestedAgent, createSettings.disabledTuiAgents)
-        : false
-    if ((args.startup || args.startupAgent) && requestedAgent && !requestedAgentEnabled) {
-      throw new Error('Selected agent is disabled. Choose an enabled agent before creating.')
+      requestedAgent !== undefined &&
+      isTuiAgentEnabled(requestedAgent, createSettings.disabledTuiAgents)
+    if ((args.startup || args.startupAgent) && requestedAgent) {
+      this.assertTuiAgentLauncherEnabled(requestedAgent, createSettings.disabledTuiAgents)
     }
-    if (
-      args.startup &&
-      args.startupDraftPaste &&
-      !isTuiAgentEnabled(args.startupDraftPaste.agent, createSettings.disabledTuiAgents)
-    ) {
-      throw new Error('Selected agent is disabled. Choose an enabled agent before creating.')
+    if (args.startup && args.startupDraftPaste) {
+      this.assertTuiAgentLauncherEnabled(
+        args.startupDraftPaste.agent,
+        createSettings.disabledTuiAgents
+      )
     }
     const agentStartup =
       !args.startup && args.startupAgent
@@ -29868,8 +29876,8 @@ export class OrcaRuntimeService {
     workspace: TerminalWorkspaceLaunchScope,
     opts: TerminalCreateOptions
   ): Promise<TerminalCreateOptions> {
-    // Why: raw shell commands like `codex exec` must remain user-authored shell.
-    // Only unmanaged, repo-backed, bare agent launches get Settings defaults.
+    // Raw shell commands like `codex exec` stay user-authored. Every known TUI
+    // honors the roster; only repo-backed bare launches receive Settings defaults.
     const callerSuppliedLaunch =
       opts.env ||
       opts.launchConfig ||
@@ -29890,21 +29898,13 @@ export class OrcaRuntimeService {
       if (!store) {
         throw new Error('runtime_unavailable')
       }
-    } else if (callerSuppliedLaunch || !store || !opts.command || !workspace.repo) {
+    } else if (callerSuppliedLaunch || !store || !opts.command) {
       return opts
     }
 
     const settings = store.getSettings()
     const platform = this.getAgentLaunchPlatformForWorkspace(workspace)
     const isRemote = workspace.repo ? repoIsRemote(workspace.repo) : Boolean(workspace.connectionId)
-    const queuedShell = resolveLocalWindowsAgentStartupShell({
-      platform,
-      isRemote,
-      terminalWindowsShell: settings.terminalWindowsShell
-    })
-    if (opts.startupAgent && !isTuiAgentEnabled(opts.startupAgent, settings.disabledTuiAgents)) {
-      throw new Error(`Agent ${opts.startupAgent} is disabled. Choose an enabled agent.`)
-    }
     const agent =
       opts.startupAgent ??
       resolveBareAgentLaunchCommand({
@@ -29916,6 +29916,15 @@ export class OrcaRuntimeService {
     if (!agent) {
       return opts
     }
+    this.assertTuiAgentLauncherEnabled(agent, settings.disabledTuiAgents)
+    if (!opts.startupAgent && !workspace.repo) {
+      return opts
+    }
+    const queuedShell = resolveLocalWindowsAgentStartupShell({
+      platform,
+      isRemote,
+      terminalWindowsShell: settings.terminalWindowsShell
+    })
 
     const sessionOptions = this.toAgentSessionOptions(opts.launchPreferences)
     const startupPlan = buildAgentStartupPlan({
@@ -30051,9 +30060,7 @@ export class OrcaRuntimeService {
       canonicalWorktreeId: workspace.id
     })
     const settings = this.store.getSettings()
-    if (!isTuiAgentEnabled(request.agent, settings.disabledTuiAgents)) {
-      throw new Error('Selected agent is disabled. Choose an enabled agent before resuming.')
-    }
+    this.assertTuiAgentLauncherEnabled(request.agent, settings.disabledTuiAgents)
     const platform = this.getAgentLaunchPlatformForWorkspace(workspace)
     const isRemote = workspace.repo ? repoIsRemote(workspace.repo) : Boolean(workspace.connectionId)
     const shell = resolveLocalWindowsAgentStartupShell({
@@ -30219,9 +30226,7 @@ export class OrcaRuntimeService {
         )
         .digest('base64url')
       const settings = this.store!.getSettings()
-      if (!isTuiAgentEnabled(request.agent, settings.disabledTuiAgents)) {
-        throw new Error('Selected agent is disabled. Choose an enabled agent before creating.')
-      }
+      this.assertTuiAgentLauncherEnabled(request.agent, settings.disabledTuiAgents)
       const platform = this.getAgentLaunchPlatformForWorkspace(workspace)
       const isRemote = workspace.repo
         ? repoIsRemote(workspace.repo)
@@ -31251,9 +31256,7 @@ export class OrcaRuntimeService {
       throw new Error('runtime_unavailable')
     }
     const settings = this.store.getSettings()
-    if (!isTuiAgentEnabled(opts.agent, settings.disabledTuiAgents)) {
-      throw new Error('Selected agent is disabled. Choose an enabled agent before creating.')
-    }
+    this.assertTuiAgentLauncherEnabled(opts.agent, settings.disabledTuiAgents)
     // Why: mobile may be iOS while the shell host is Windows/macOS/Linux or SSH Linux; quote for the host shell.
     const platform = this.getAgentLaunchPlatformForWorkspace(workspace)
     // Why: SSH runs the CLI through the relay shim (plain `orca`), so the Linux-only `orca-ide` rename must not apply.
