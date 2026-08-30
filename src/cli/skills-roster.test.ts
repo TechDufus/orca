@@ -1,12 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 
-const { detectCommandsMock, runtimeCallMock } = vi.hoisted(() => ({
-  detectCommandsMock: vi.fn(() => new Set<string>(['claude'])),
-  runtimeCallMock: vi.fn()
-}))
+const { detectCommandsMock, runtimeCallMock, readHookSettingsMock, readHookSettingsFromDiskMock } =
+  vi.hoisted(() => ({
+    detectCommandsMock: vi.fn(() => new Set<string>(['claude'])),
+    runtimeCallMock: vi.fn(),
+    readHookSettingsMock: vi.fn(),
+    readHookSettingsFromDiskMock: vi.fn(() => ({
+      agentStatusHooksEnabled: true,
+      disabledTuiAgents: [] as string[]
+    }))
+  }))
 
 vi.mock('../shared/local-agent-install-dir-detection', () => ({
   detectCommandsInInstallDirs: detectCommandsMock
+}))
+
+vi.mock('./handlers/agent-hooks', () => ({
+  readHookSettings: readHookSettingsMock,
+  readHookSettingsFromDisk: readHookSettingsFromDiskMock
 }))
 
 vi.mock('./bundled-skill-guides.js', () => ({
@@ -24,17 +35,25 @@ vi.mock('./bundled-skill-guides.js', () => ({
 import type { HandlerContext } from './dispatch'
 import { SKILL_HANDLERS } from './handlers/skills'
 
-function context(flags: Map<string, string | boolean>, json = false): HandlerContext {
+function context(
+  flags: Map<string, string | boolean>,
+  json = false,
+  isRemote = false
+): HandlerContext {
   return {
     flags,
-    client: { call: runtimeCallMock } as never,
+    client: { call: runtimeCallMock, isRemote } as never,
     cwd: '/tmp/repo',
     json
   }
 }
 
-async function install(flags: Map<string, string | boolean>, json = false): Promise<void> {
-  await SKILL_HANDLERS['skills install']!(context(flags, json))
+async function install(
+  flags: Map<string, string | boolean>,
+  json = false,
+  isRemote = false
+): Promise<void> {
+  await SKILL_HANDLERS['skills install']!(context(flags, json, isRemote))
 }
 
 describe('skills install agent roster', () => {
@@ -43,9 +62,24 @@ describe('skills install agent roster', () => {
     detectCommandsMock.mockReset()
     detectCommandsMock.mockReturnValue(new Set<string>(['claude']))
     runtimeCallMock.mockReset()
+    readHookSettingsMock.mockReset()
+    readHookSettingsMock.mockImplementation(async (client) => {
+      try {
+        const response = await client.call('settings.get', undefined, { timeoutMs: 1_000 })
+        return response.result.settings
+      } catch {
+        return readHookSettingsFromDiskMock()
+      }
+    })
+    readHookSettingsFromDiskMock.mockReset()
+    readHookSettingsFromDiskMock.mockReturnValue({
+      agentStatusHooksEnabled: true,
+      disabledTuiAgents: []
+    })
     runtimeCallMock.mockResolvedValue({
       result: {
         settings: {
+          agentStatusHooksEnabled: true,
           defaultTuiAgent: null,
           disabledTuiAgents: []
         }
@@ -79,6 +113,7 @@ describe('skills install agent roster', () => {
     runtimeCallMock.mockResolvedValue({
       result: {
         settings: {
+          agentStatusHooksEnabled: true,
           defaultTuiAgent: null,
           disabledTuiAgents: ['claude', 'rovo']
         }
@@ -95,7 +130,54 @@ describe('skills install agent roster', () => {
     expect(stdoutText(stdoutSpy)).toContain('--agent codex --agent universal')
     expect(stdoutText(stdoutSpy)).not.toContain('--agent claude-code')
     expect(stdoutText(stdoutSpy)).not.toContain('--agent rovodev')
-    expect(runtimeCallMock).toHaveBeenCalledWith('settings.get', undefined)
+    expect(runtimeCallMock).toHaveBeenCalledWith('settings.get', undefined, { timeoutMs: 1_000 })
+  })
+
+  it('uses the persisted local roster for a remote runtime selection', async () => {
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    detectCommandsMock.mockReturnValue(new Set<string>(['claude', 'codex']))
+    readHookSettingsFromDiskMock.mockReturnValue({
+      agentStatusHooksEnabled: true,
+      disabledTuiAgents: ['claude']
+    })
+
+    await install(
+      new Map<string, string | boolean>([
+        ['skill', 'alpha'],
+        ['dry-run', true]
+      ]),
+      false,
+      true
+    )
+
+    expect(stdoutText(stdoutSpy)).toContain('--agent codex --agent universal')
+    expect(stdoutText(stdoutSpy)).not.toContain('--agent claude-code')
+    expect(runtimeCallMock).not.toHaveBeenCalled()
+    expect(readHookSettingsMock).not.toHaveBeenCalled()
+    expect(readHookSettingsFromDiskMock).toHaveBeenCalledOnce()
+  })
+
+  it('uses the persisted local roster when the local runtime is unavailable', async () => {
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    detectCommandsMock.mockReturnValue(new Set<string>(['codex', 'rovo']))
+    runtimeCallMock.mockRejectedValue(new Error('runtime unavailable'))
+    readHookSettingsFromDiskMock.mockReturnValue({
+      agentStatusHooksEnabled: true,
+      disabledTuiAgents: ['rovo']
+    })
+
+    await install(
+      new Map<string, string | boolean>([
+        ['skill', 'alpha'],
+        ['dry-run', true]
+      ])
+    )
+
+    expect(stdoutText(stdoutSpy)).toContain('--agent codex --agent universal')
+    expect(stdoutText(stdoutSpy)).not.toContain('--agent rovodev')
+    expect(runtimeCallMock).toHaveBeenCalledWith('settings.get', undefined, { timeoutMs: 1_000 })
+    expect(readHookSettingsMock).toHaveBeenCalledOnce()
+    expect(readHookSettingsFromDiskMock).toHaveBeenCalledOnce()
   })
 
   it('preserves an explicitly named disabled agent without reading the roster', async () => {
@@ -113,6 +195,8 @@ describe('skills install agent roster', () => {
 
     expect(stdoutText(stdoutSpy)).toContain('--agent codex')
     expect(runtimeCallMock).not.toHaveBeenCalled()
+    expect(readHookSettingsMock).not.toHaveBeenCalled()
+    expect(readHookSettingsFromDiskMock).not.toHaveBeenCalled()
     expect(detectCommandsMock).not.toHaveBeenCalled()
   })
 
@@ -122,6 +206,7 @@ describe('skills install agent roster', () => {
     runtimeCallMock.mockResolvedValue({
       result: {
         settings: {
+          agentStatusHooksEnabled: true,
           defaultTuiAgent: null,
           disabledTuiAgents: ['claude']
         }

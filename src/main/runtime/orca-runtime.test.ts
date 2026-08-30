@@ -14755,6 +14755,35 @@ describe('OrcaRuntimeService', () => {
     expect(spawn).not.toHaveBeenCalled()
   })
 
+  it('refuses a disabled known TUI folder create that also supplies launch metadata', async () => {
+    const folderPath = await mkdtemp(join(tmpdir(), 'orca-runtime-folder-disabled-agent-meta-'))
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-bg' })
+    const folderWorkspace = makeFolderWorkspace({ folderPath })
+    const projectGroup = makeFolderProjectGroup({ parentPath: folderPath })
+    const runtime = new OrcaRuntimeService({
+      ...createFolderWorkspaceRuntimeStore(folderWorkspace, projectGroup),
+      getSettings: () => ({
+        ...store.getSettings(),
+        disabledTuiAgents: ['codex' as const],
+        agentCmdOverrides: {}
+      })
+    } as never)
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+
+    await expect(
+      runtime.createTerminal(`id:${TEST_FOLDER_WORKSPACE_KEY}`, {
+        command: 'codex',
+        env: { CALLER_ENV: 'keep' }
+      })
+    ).rejects.toMatchObject({ code: 'agent_unconfigured' })
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
   // Why: silently returning the caller's opts would spawn a bare shell that can
   // only time out at agent readiness — the failure startupAgent exists to stop.
   it('rejects a startupAgent create that also supplies its own launch', async () => {
@@ -14815,7 +14844,7 @@ describe('OrcaRuntimeService', () => {
 
     await expect(
       runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, { startupAgent: 'cursor' })
-    ).rejects.toThrow(/disabled/)
+    ).rejects.toMatchObject({ code: 'agent_unconfigured' })
     expect(spawn).not.toHaveBeenCalled()
   })
 
@@ -15007,6 +15036,100 @@ describe('OrcaRuntimeService', () => {
       expect(spawn).not.toHaveBeenCalled()
     }
   )
+
+  it.each([
+    { name: 'env', extra: { env: { CODEX_HOME: '/tmp/caller-codex-home' } } },
+    {
+      name: 'launchConfig',
+      extra: { launchConfig: { agentCommand: 'codex', agentArgs: '', agentEnv: {} } }
+    },
+    { name: 'startupCommandDelivery', extra: { startupCommandDelivery: 'fast' as const } },
+    { name: 'launchAgent', extra: { launchAgent: 'codex' as const } }
+  ])('refuses a disabled known TUI create that also supplies $name', async ({ extra }) => {
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-bg' })
+    const runtime = new OrcaRuntimeService({
+      ...store,
+      getSettings: () => ({
+        ...store.getSettings(),
+        disabledTuiAgents: ['codex' as const],
+        agentCmdOverrides: {},
+        agentDefaultArgs: { codex: '--dangerously-bypass-approvals-and-sandbox' },
+        agentDefaultEnv: {}
+      })
+    })
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+
+    await expect(
+      runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, { command: 'codex', ...extra })
+    ).rejects.toMatchObject({ code: 'agent_unconfigured' })
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('refuses a disabled launchAgent even when the command is not that TUI', async () => {
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-bg' })
+    const runtime = new OrcaRuntimeService({
+      ...store,
+      getSettings: () => ({
+        ...store.getSettings(),
+        disabledTuiAgents: ['codex' as const],
+        agentCmdOverrides: {}
+      })
+    })
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+
+    await expect(
+      runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, {
+        command: 'echo hi',
+        launchAgent: 'codex'
+      })
+    ).rejects.toMatchObject({ code: 'agent_unconfigured' })
+    await expect(
+      runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, { launchAgent: 'codex' })
+    ).rejects.toMatchObject({ code: 'agent_unconfigured' })
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('does not overwrite caller-supplied launch metadata with Settings defaults', async () => {
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-bg' })
+    const runtime = new OrcaRuntimeService({
+      ...store,
+      getSettings: () => ({
+        ...store.getSettings(),
+        disabledTuiAgents: [],
+        agentCmdOverrides: {},
+        agentDefaultArgs: { codex: '--dangerously-bypass-approvals-and-sandbox' },
+        agentDefaultEnv: { codex: { CODEX_PROFILE: 'captured' } }
+      })
+    })
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+
+    await runtime.createTerminal(`path:${TEST_WORKTREE_PATH}`, {
+      command: 'codex',
+      env: { CALLER_ENV: 'keep' }
+    })
+
+    const spawnCall = spawn.mock.calls[0]?.[0] as
+      | { command?: string; env?: Record<string, string> }
+      | undefined
+    expect(spawnCall?.command).toBe('codex')
+    expect(spawnCall?.env).toMatchObject({ CALLER_ENV: 'keep' })
+    expect(spawnCall?.env?.CODEX_PROFILE).toBeUndefined()
+  })
 
   it('sends Settings agent defaults through renderer-backed bare agent terminal creates', async () => {
     const runtimeStore = {
@@ -34844,6 +34967,36 @@ describe('OrcaRuntimeService', () => {
     await expect(
       runtime.createMobileSessionTerminal(`id:${TEST_WORKTREE_ID}`, {
         agent: 'codex'
+      })
+    ).rejects.toMatchObject({ code: 'agent_unconfigured' })
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('rejects a disabled known TUI mobile create that supplies launch metadata', async () => {
+    const spawn = vi.fn().mockResolvedValue({ id: 'pty-agent' })
+    const runtime = new OrcaRuntimeService({
+      ...store,
+      getSettings: () => ({
+        ...store.getSettings(),
+        disabledTuiAgents: ['codex'],
+        agentCmdOverrides: {}
+      })
+    } as never)
+    runtime.setPtyController({
+      spawn,
+      write: () => true,
+      kill: () => true,
+      getForegroundProcess: async () => null
+    })
+    runtime.syncWindowGraph(0, { tabs: [], leaves: [] })
+
+    await expect(
+      runtime.createMobileSessionTerminal(`id:${TEST_WORKTREE_ID}`, {
+        command: 'codex',
+        env: { CODEX_HOME: '/tmp/caller-codex-home' },
+        launchConfig: { agentCommand: 'codex', agentArgs: '', agentEnv: {} },
+        startupCommandDelivery: 'fast',
+        launchAgent: 'codex'
       })
     ).rejects.toMatchObject({ code: 'agent_unconfigured' })
     expect(spawn).not.toHaveBeenCalled()

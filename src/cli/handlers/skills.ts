@@ -19,8 +19,8 @@ import {
   buildAgentFeatureSkillInstallArgs,
   buildAgentFeatureSkillUpdateArgs
 } from '../../shared/agent-feature-install-commands'
-import type { GlobalSettings } from '../../shared/global-settings-types'
 import { buildTuiAgentRoster } from '../../shared/tui-agent-selection'
+import { readHookSettings, readHookSettingsFromDisk } from './agent-hooks'
 
 type BundledSkillGuide = {
   name: string
@@ -208,12 +208,15 @@ async function resolveInstallAgentKeys(
     }
     return keys
   }
-  const response = await getClient().call<{
-    settings: Pick<GlobalSettings, 'defaultTuiAgent' | 'disabledTuiAgents'>
-  }>('settings.get', undefined)
-  const roster = buildTuiAgentRoster(response.result.settings)
+  const detectedAgents = detectSkillsCliAgents()
+  const client = getClient()
+  const settings = client.isRemote ? readHookSettingsFromDisk() : await readHookSettings(client)
+  const roster = buildTuiAgentRoster({
+    defaultTuiAgent: null,
+    disabledTuiAgents: settings.disabledTuiAgents
+  })
   const enabled = new Set(roster.enabled)
-  const detected = detectSkillsCliAgents().filter((agent) => enabled.has(agent))
+  const detected = detectedAgents.filter((agent) => enabled.has(agent))
   if (detected.length > 0) {
     return toSkillsCliAgentKeys(detected)
   }

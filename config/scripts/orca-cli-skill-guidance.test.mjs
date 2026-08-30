@@ -83,6 +83,9 @@ describe('orca CLI skill guidance', () => {
       expect(skill).toContain('agent roster --json')
       expect(skill).toContain('agent_unconfigured')
     }
+    for (const skill of [cliSkill, orchestrationSkill]) {
+      expect(skill).toContain('--command "<requested-agent>"')
+    }
     expect(cliSkill).toContain('Installed or detected binaries are not necessarily enabled')
     expect(orchestrationSkill).toContain('Never route around that refusal')
   })

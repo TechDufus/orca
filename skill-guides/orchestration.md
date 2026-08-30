@@ -403,7 +403,7 @@ orca terminal read --terminal <handle> --json
 orca terminal send --terminal <handle> --text <text> --enter --json
 ```
 
-If an older CLI rejects `worktree create --agent`, first confirm the requested id is enabled in `orca agent roster --json`, then create the worktree normally and run `orca terminal create --worktree <selector> --command "codex" --json` or `--command "claude"`. Do not use this fallback to bypass `agent_unconfigured`.
+If an older CLI rejects `worktree create --agent`, first confirm the requested id is enabled in `orca agent roster --json`, then create the worktree normally and run `orca terminal create --worktree <selector> --command "<requested-agent>" --json`. Do not use this fallback to bypass `agent_unconfigured`.
 
 Wait for `tui-idle` before dispatching. Always pass `--timeout-ms`; real coding tasks can take 15-60 minutes. During supervision, use rolling `check --wait` windows. If a window returns no matching message, inspect `task-list`, `terminal read`, or `terminal wait --for tui-idle` as a liveness checkpoint; if the terminal is still working or producing activity, keep waiting instead of retrying the task.
 

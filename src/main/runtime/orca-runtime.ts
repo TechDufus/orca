@@ -20424,6 +20424,30 @@ export class OrcaRuntimeService {
     }
   }
 
+  // Known TUI command or launchAgent still honor the roster when the caller
+  // already supplied env/launchConfig (Settings defaults must not be applied).
+  private assertKnownTuiCreateLaunchRoster(
+    workspace: TerminalWorkspaceLaunchScope,
+    opts: { command?: string; launchAgent?: TuiAgent }
+  ): void {
+    const settings = this.store?.getSettings()
+    if (!settings) {
+      return
+    }
+    if (opts.launchAgent) {
+      this.assertTuiAgentLauncherEnabled(opts.launchAgent, settings.disabledTuiAgents)
+    }
+    const agent = resolveBareAgentLaunchCommand({
+      command: opts.command,
+      settings,
+      platform: this.getAgentLaunchPlatformForWorkspace(workspace),
+      isRemote: workspace.repo ? repoIsRemote(workspace.repo) : Boolean(workspace.connectionId)
+    })
+    if (agent) {
+      this.assertTuiAgentLauncherEnabled(agent, settings.disabledTuiAgents)
+    }
+  }
+
   validateOrchestrationAgentLauncher(agent: TuiAgent): void {
     const settings = this.store?.getSettings()
     if (!settings) {
@@ -29898,7 +29922,14 @@ export class OrcaRuntimeService {
       if (!store) {
         throw new Error('runtime_unavailable')
       }
-    } else if (callerSuppliedLaunch || !store || !opts.command) {
+    } else if (!store) {
+      return opts
+    }
+
+    this.assertKnownTuiCreateLaunchRoster(workspace, opts)
+    // Caller-supplied launch metadata is asserted above, then returned
+    // unchanged so Settings defaults cannot overwrite it.
+    if (!opts.startupAgent && (callerSuppliedLaunch || !opts.command)) {
       return opts
     }
 
@@ -31243,6 +31274,10 @@ export class OrcaRuntimeService {
     launchAgent?: TuiAgent
   }> {
     if (opts.command || !opts.agent) {
+      this.assertKnownTuiCreateLaunchRoster(workspace, {
+        command: opts.command,
+        launchAgent: opts.launchAgent
+      })
       return {
         command: opts.command,
         env: opts.env,
@@ -31327,7 +31362,9 @@ export class OrcaRuntimeService {
       env: opts.env,
       envToDelete: opts.envToDelete,
       ...(opts.launchConfig ? { launchConfig: opts.launchConfig } : {}),
-      ...(opts.launchAgent ? { launchAgent: opts.launchAgent } : {}),
+      // Why: a disabled pending-tab fallback is a plain shell; keep launchAgent
+      // on the tab identity without asking createTerminal to launch it.
+      ...(opts.command && opts.launchAgent ? { launchAgent: opts.launchAgent } : {}),
       ...(opts.viewMode ? { viewMode: opts.viewMode } : {}),
       startupCommandDelivery: opts.startupCommandDelivery,
       ...(opts.identity
