@@ -29,6 +29,7 @@ import type {
 import { getPRForBranch } from '../github/client'
 import { listWorktrees, addWorktree, addSparseWorktree } from '../git/worktree'
 import type { AddWorktreeOptions, AddWorktreeResult } from '../git/worktree'
+import { consumePreparedWorktreeCreate } from '../worktree-create-preparation'
 import {
   getBranchConflictKind,
   resolveDefaultBaseRefViaExec,
@@ -89,7 +90,7 @@ import {
   shouldSetDisplayName,
   mergeWorktree
 } from './worktree-logic'
-import { findCreatedWorktree } from './created-worktree-reconciliation'
+import { findCreatedWorktree, resolveCreatedWorktree } from './created-worktree-reconciliation'
 import type { BranchPrefixSettings } from '../../shared/branch-prefix'
 import { getRepoIdFromWorktreeId } from '../../shared/worktree/id'
 import { parseWorkspaceKey, worktreeWorkspaceKey } from '../../shared/workspace-scope'
@@ -107,7 +108,10 @@ import {
   prepareWorktreePushTargetWithExec
 } from './worktree-push-target-setup'
 import { isENOENT } from './filesystem-path-containment'
-import { registerWorktreeRootsForRepo } from './registered-worktree-roots-cache'
+import {
+  registerCreatedWorktreeRoot,
+  registerWorktreeRootsForRepo
+} from './registered-worktree-roots-cache'
 import {
   createWorktreeCopiedPaths,
   createWorktreeLinkedPaths,
@@ -133,7 +137,8 @@ import {
 } from '../agent-trust-presets'
 import {
   getLocalProjectGitExecOptions,
-  getLocalProjectWorktreeGitOptions
+  getLocalProjectWorktreeGitOptions,
+  getWorktreeMirrorDistro
 } from '../project-runtime-git-options'
 import {
   getBranchNameOverrideCandidate,
@@ -1835,9 +1840,9 @@ export async function createRemoteWorktree(
   const gitWorktrees = await timing.time('list_created_worktree', async () =>
     provider.listWorktrees(repo.path)
   )
-  const created = gitWorktrees.find(
-    (gw) => gw.branch?.endsWith(branchName) || gw.path.endsWith(effectiveSanitizedName)
-  )
+  // Match the exact requested path first, then the exact branch ref. Suffix matching can
+  // select an older `prefix/<branchName>` worktree when the newly created row is present.
+  const created = findCreatedWorktree(gitWorktrees, remotePath, branchName)
   if (!created) {
     throw new Error('Worktree created but not found in listing')
   }
@@ -1996,7 +2001,11 @@ export async function createLocalWorktree(
 ): Promise<CreateWorktreeResult> {
   const timing = createWorktreeCreateTimingRecorder()
   const settings = store.getSettings()
-  const worktreePathSettings = getWorktreePathSettings(repo, settings)
+  const worktreePathSettings = getWorktreePathSettings(
+    repo,
+    settings,
+    getWorktreeMirrorDistro(store, repo)
+  )
   const localGitExecOptions = getLocalProjectGitExecOptions(store, repo)
   const localWorktreeGitOptions = getLocalProjectWorktreeGitOptions(store, repo)
   const hasLocalWorktreeGitOptions = Object.keys(localWorktreeGitOptions).length > 0
@@ -2376,10 +2385,27 @@ export async function createLocalWorktree(
     ...remoteTrackingBaseOption,
     ...(suggestLocalBaseRefUpdate ? { suggestLocalBaseRefUpdate } : {})
   }
+  const preparedWorktreeOptions = suggestLocalBaseRefUpdate
+    ? addProjectGitOptions({ ...remoteTrackingBaseOption, suggestLocalBaseRefUpdate })
+    : addProjectGitOptions(remoteTrackingBaseOption)
   let addResult: AddWorktreeResult
   try {
     addResult =
       (await timing.time('git_worktree_add', async () => {
+        if (sparseDirectories.length === 0 && !checkoutExistingBranch) {
+          const preparedResult = await consumePreparedWorktreeCreate({
+            repoPath: repo.path,
+            workspaceRoot,
+            worktreePath,
+            branch: branchName,
+            baseBranch,
+            refreshLocalBaseRef: settings.refreshLocalBaseRefOnWorktreeCreate,
+            ...(preparedWorktreeOptions ? { options: preparedWorktreeOptions } : {})
+          })
+          if (preparedResult) {
+            return preparedResult
+          }
+        }
         if (sparseDirectories.length > 0) {
           if (checkoutExistingBranch) {
             return addSparseWorktree(
@@ -2489,16 +2515,18 @@ export async function createLocalWorktree(
   }
 
   // Re-list to get the freshly created worktree info
-  const gitWorktrees = await timing.time('list_created_worktree', async () =>
-    hasLocalWorktreeGitOptions
-      ? listWorktrees(repo.path, localWorktreeGitOptions)
-      : listWorktrees(repo.path)
+  const {
+    created,
+    worktrees: gitWorktrees,
+    listingComplete
+  } = await timing.time('list_created_worktree', async () =>
+    resolveCreatedWorktree(
+      repo.path,
+      worktreePath,
+      branchName,
+      hasLocalWorktreeGitOptions ? localWorktreeGitOptions : undefined
+    )
   )
-  // Why: Git may canonicalize a symlinked create path; its exact branch identifies the listed row.
-  const created = findCreatedWorktree(gitWorktrees, worktreePath, branchName)
-  if (!created) {
-    throw new Error('Worktree created but not found in listing')
-  }
 
   const worktreeId = `${repo.id}::${created.path}`
   const now = Date.now()
@@ -2573,10 +2601,18 @@ export async function createLocalWorktree(
     now
   )
   // Why: reuse the roots creation already paid for via `git worktree list` so later IPC doesn't lazily rescan and trip macOS privacy prompts.
-  registerWorktreeRootsForRepo(store, repo.id, [
-    repo.path,
-    ...gitWorktrees.map((worktree) => worktree.path)
-  ])
+  // Why gated: registration replaces the repo's root set, so registering a create recovered without
+  // a listing would revoke filesystem access to every worktree that listing would have named.
+  if (listingComplete) {
+    registerWorktreeRootsForRepo(store, repo.id, [
+      repo.path,
+      ...gitWorktrees.map((worktree) => worktree.path)
+    ])
+  } else {
+    // Recovered without a listing: authorize just the new root, or the create the user just made
+    // is rejected by filesystem/git-status IPC until a full scan repopulates the cache.
+    registerCreatedWorktreeRoot(store, repo.id, created.path)
+  }
 
   // Why: link user-configured shared paths (e.g. `node_modules`, `.env`) before setup runs so setup scripts see them in place.
   const symlinkPaths = repo.symlinkPaths ?? []
